@@ -36,6 +36,7 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument('--dataset', metavar='PATH', type=str, required=True, help='Input file, directory, or glob pattern (utf-8 text, or preencoded .npz files).')
 parser.add_argument('--model_name', metavar='MODEL', type=str, default='117M', help='Pretrained model name')
+parser.add_argument('--storage_name', metavar='STORAGE', type=str, default=None, help='Name of Google Cloud Storage instance')
 parser.add_argument('--combine', metavar='CHARS', type=int, default=50000, help='Concatenate input files with <|endoftext|> separator into chunks of this minimum size')
 
 parser.add_argument('--batch_size', metavar='SIZE', type=int, default=1, help='Batch size')
@@ -77,10 +78,10 @@ parser.add_argument('--float16', default=False, action='store_true', help='Use f
 parser.add_argument('--dtype', type=str, default='float32', help='dtype. <float32|float16|bfloat16>.')
 
 # 1.5B
-#parser.add_argument('--n_ctx', type=int, default=1024, help='For a fresh model, how large should n_ctx be?')
-#parser.add_argument('--n_embd', type=int, default=1600, help='For a fresh model, how large should n_embd be?')
-#parser.add_argument('--n_head', type=int, default=25, help='For a fresh model, how large should n_head be?')
-#parser.add_argument('--n_layer', type=int, default=48, help='For a fresh model, how large should n_layer be?')
+parser.add_argument('--n_ctx', type=int, default=1024, help='For a fresh model, how large should n_ctx be?')
+parser.add_argument('--n_embd', type=int, default=1600, help='For a fresh model, how large should n_embd be?')
+parser.add_argument('--n_head', type=int, default=25, help='For a fresh model, how large should n_head be?')
+parser.add_argument('--n_layer', type=int, default=48, help='For a fresh model, how large should n_layer be?')
 
 # 345M
 #parser.add_argument('--n_ctx', type=int, default=1024, help='For a fresh model, how large should n_ctx be?')
@@ -94,10 +95,10 @@ parser.add_argument('--dtype', type=str, default='float32', help='dtype. <float3
 #parser.add_argument('--n_head', type=int, default=12, help='For a fresh model, how large should n_head be?')
 #parser.add_argument('--n_layer', type=int, default=12, help='For a fresh model, how large should n_layer be?')
 
-parser.add_argument('--n_ctx', type=int, default=-1, help='For a fresh model, how large should n_ctx be?')
-parser.add_argument('--n_embd', type=int, default=-1, help='For a fresh model, how large should n_embd be?')
-parser.add_argument('--n_head', type=int, default=-1, help='For a fresh model, how large should n_head be?')
-parser.add_argument('--n_layer', type=int, default=-1, help='For a fresh model, how large should n_layer be?')
+#parser.add_argument('--n_ctx', type=int, default=-1, help='For a fresh model, how large should n_ctx be?')
+#parser.add_argument('--n_embd', type=int, default=-1, help='For a fresh model, how large should n_embd be?')
+#parser.add_argument('--n_head', type=int, default=-1, help='For a fresh model, how large should n_head be?')
+#parser.add_argument('--n_layer', type=int, default=-1, help='For a fresh model, how large should n_layer be?')
 
 parser.add_argument('--sample_ctx', type=int, default=-1, help='Compute loss over N samples. Equal to n_ctx if set < 0.')
 
@@ -312,25 +313,37 @@ def main():
         if args.save_graph:
             summary_log.add_graph(tf.get_default_graph())
 
-        saver = tflex.Saver(
+        saver = tf.compat.v1.train.Saver(
             var_list=all_vars,
-            max_to_keep=args.max_to_keep,
-            keep_checkpoint_every_n_hours=2,
-            reshape=args.truncate_weights)
+            max_to_keep=args.max_to_keep)
         sess.run(tf.global_variables_initializer())
 
-        if args.restore_from == 'latest':
-            ckpt = tflex.latest_checkpoint(
-                os.path.join(CHECKPOINT_DIR, args.run_name))
-            if ckpt is None:
-                # Get fresh GPT weights if new run.
+        if args.storage_name is not None:
+            if args.restore_from == 'latest':
+                ckpt = tflex.latest_checkpoint(
+                    os.path.join('gs://' + args.storage_name + '/', CHECKPOINT_DIR, args.run_name))
+                if ckpt is None:
+                    # Get fresh GPT weights if new run.
+                    ckpt = tflex.latest_checkpoint(
+                        os.path.join('gs://' + args.storage_name + '/', 'models', args.model_name))
+            elif args.restore_from == 'fresh':
+                ckpt = tflex.latest_checkpoint(
+                    os.path.join('gs://' + args.storage_name + '/', 'models', args.model_name))
+            else:
+                ckpt = tflex.latest_checkpoint(args.restore_from)
+        else:
+            if args.restore_from == 'latest':
+                ckpt = tflex.latest_checkpoint(
+                    os.path.join(CHECKPOINT_DIR, args.run_name))
+                if ckpt is None:
+                    # Get fresh GPT weights if new run.
+                    ckpt = tflex.latest_checkpoint(
+                        os.path.join('models', args.model_name))
+            elif args.restore_from == 'fresh':
                 ckpt = tflex.latest_checkpoint(
                     os.path.join('models', args.model_name))
-        elif args.restore_from == 'fresh':
-            ckpt = tflex.latest_checkpoint(
-                os.path.join('models', args.model_name))
-        else:
-            ckpt = tflex.latest_checkpoint(args.restore_from)
+            else:
+                ckpt = tflex.latest_checkpoint(args.restore_from)
         print('Loading snapshot %s...' % ckpt)
         t0 = time.time()
         if not args.fresh_model:
@@ -375,10 +388,16 @@ def main():
                 os.path.join(CHECKPOINT_DIR, args.run_name,
                              'model-{}').format(counter))
             t0 = time.time()
-            saver.save(
-                sess,
-                os.path.join(CHECKPOINT_DIR, args.run_name, 'model'),
-                global_step=counter)
+            if args.storage_name is not None:
+                saver.save(
+                    sess,
+                    os.path.join("gs://" + args.storage_name + "/", CHECKPOINT_DIR, args.run_name, 'model'),
+                    global_step=counter)
+            else:
+                saver.save(
+                    sess,
+                    os.path.join(CHECKPOINT_DIR, args.run_name, 'model'),
+                    global_step=counter)
             t1 = time.time()
             print('Saved in %f seconds' % (t1 - t0))
             with open(counter_path, 'w') as fp:
@@ -486,7 +505,7 @@ def main():
                     (v_loss, v_summary) = sess.run((opt_apply, summaries))
                 else:
                     batch = sample_batch()
-                    say('Running opt_apply...')
+                    #say('Running opt_apply...')
                     (_, v_loss, v_summary) = sess.run(
                         (opt_apply, loss, summaries),
                         feed_dict={context: batch})
